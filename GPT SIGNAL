@@ -1,0 +1,50 @@
+const TelegramBot = require("node-telegram-bot-api");
+const axios = require("axios");
+const ti = require("technicalindicators");
+const express = require("express");
+const app = express();
+
+// 🔑 Bot token (BotFather bergan tokenni shu yerga yoz)
+const TOKEN = process.env.BOT_TOKEN;
+const bot = new TelegramBot(TOKEN, { polling: true });
+
+// 📊 Aktivlar (xohlaganingni yoz)
+const SYMBOLS = ["XAUUSD=X", "EURUSD=X", "BTC-USD"];
+
+// 🧮 RSI va MA signal funksiyasi
+async function getSignal(symbol) {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1m&range=1d`;
+  try {
+    const res = await axios.get(url);
+    const prices = res.data.chart.result[0].indicators.quote[0].close.filter(p => p);
+    const rsi = ti.RSI.calculate({ values: prices, period: 14 }).slice(-1)[0];
+    const ma5 = ti.SMA.calculate({ values: prices, period: 5 }).slice(-1)[0];
+    const ma20 = ti.SMA.calculate({ values: prices, period: 20 }).slice(-1)[0];
+    const price = prices[prices.length - 1];
+
+    if (rsi < 30 && ma5 > ma20) return { signal: "BUY 📈", rsi, price };
+    if (rsi > 70 && ma5 < ma20) return { signal: "SELL 📉", rsi, price };
+    return null;
+  } catch (err) {
+    return null;
+  }
+}
+
+// 🚀 Start komandasi
+bot.onText(/\/start/, (msg) => {
+  const chatId = msg.chat.id;
+  bot.sendMessage(chatId, "🤖 Pocket Option Signal Bot ishga tushdi!\nStrategiya: RSI + MA (1m)\nAktivlar: " + SYMBOLS.join(", "));
+  
+  setInterval(async () => {
+    for (const symbol of SYMBOLS) {
+      const result = await getSignal(symbol);
+      if (result) {
+        bot.sendMessage(chatId, `📊 ${symbol}\nSignal: ${result.signal}\nRSI: ${result.rsi.toFixed(2)}\nNarx: ${result.price.toFixed(3)}`);
+      }
+      await new Promise(r => setTimeout(r, 4000));
+    }
+  }, 60000);
+});
+
+app.get("/", (req, res) => res.send("Bot running..."));
+app.listen(3000, () => console.log("Server started"));
