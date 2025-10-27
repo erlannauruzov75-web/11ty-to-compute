@@ -1,0 +1,228 @@
+import os
+import asyncio
+import time
+import requests
+import pandas as pd
+import numpy as np
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+# ========== SOZLAMALAR ==========
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "BU_YERGA_BOT_TOKENINGIZNI_QO'YING"
+POLL_INTERVAL = 60  # sekund
+RSI_PERIOD = 14
+MA_SHORT = 5
+MA_LONG = 20
+RSI_BUY = 35.0
+RSI_SELL = 65.0
+
+# TP / SL foizlari (Pocket Option uchun)
+TP_PERCENT = 0.15   # 0.15% foyda olish
+SL_PERCENT = 0.10   # 0.10% zarar chegarasi
+
+watched = {}
+last_signals = {}
+
+COINGECKO_IDS = {
+    "BTC":"bitcoin", "ETH":"ethereum","BNB":"binancecoin","SOL":"solana",
+    "XRP":"ripple","ADA":"cardano","DOGE":"dogecoin","LTC":"litecoin"
+}
+
+# ========== Ma'lumot olish ==========
+def get_crypto_closes(symbol):
+    s = symbol.upper().replace("USDT","")
+    coin_id = COINGECKO_IDS.get(s)
+    if not coin_id:
+        return None
+    try:
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart?vs_currency=usd&days=1&interval=minutely"
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        j = r.json()
+        prices = [p[1] for p in j.get("prices", [])]
+        return prices
+    except:
+        return None
+
+def get_forex_closes(symbol):
+    s = symbol.upper()
+    candidates = [f"{s}=X", s]
+    for v in candidates:
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{v}?interval=1m&range=1d"
+            r = requests.get(url, timeout=8)
+            if r.status_code != 200:
+                continue
+            j = r.json()
+            closes = j["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+            closes = [c for c in closes if c is not None]
+            if closes:
+                return closes
+        except:
+            continue
+    return None
+
+def get_prices(symbol):
+    if symbol.upper() in COINGECKO_IDS or symbol.upper().endswith("USDT"):
+        return get_crypto_closes(symbol)
+    return get_forex_closes(symbol)
+
+# ========== Indikatorlar ==========
+def calc_rsi(prices, period=RSI_PERIOD):
+    if len(prices) < period + 1:
+        return None
+    s = pd.Series(prices)
+    delta = s.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return float(rsi.iloc[-1])
+
+def ma(prices, window):
+    if len(prices) < window:
+        return None
+    return float(np.mean(prices[-window:]))
+
+# ========== Signal baholash ==========
+def evaluate(symbol):
+    data = get_prices(symbol)
+    if not data or len(data) < 25:
+        return {"ok": False, "error": "Ma'lumot olinmadi yoki yetarli emas."}
+    rsi = calc_rsi(data)
+    ma5 = ma(data, MA_SHORT)
+    ma20 = ma(data, MA_LONG)
+    price = data[-1]
+
+    if rsi is None or ma5 is None or ma20 is None:
+        return {"ok": False, "error": "Indikatorlar hisoblanmadi."}
+
+    signal = "WAIT"
+    if rsi < RSI_BUY and ma5 > ma20:
+        signal = "BUY"
+    elif rsi > RSI_SELL and ma5 < ma20:
+        signal = "SELL"
+
+    # TP/SL hisoblash
+    if signal == "BUY":
+        tp = price * (1 + TP_PERCENT / 100)
+        sl = price * (1 - SL_PERCENT / 100)
+    elif signal == "SELL":
+        tp = price * (1 - TP_PERCENT / 100)
+        sl = price * (1 + SL_PERCENT / 100)
+    else:
+        tp = sl = None
+
+    return {
+        "ok": True, "symbol": symbol.upper(),
+        "price": price, "rsi": round(rsi, 2),
+        "ma5": round(ma5, 6), "ma20": round(ma20, 6),
+        "signal": signal,
+        "tp": tp, "sl": sl
+    }
+
+# ========== Telegram komandalar ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Pocket Option Signal Bot (TP/SL versiya)\n\n"
+        "/signal SYMBOL — signal olish (masalan: /signal XAUUSD)\n"
+        "/watch SYMBOL — avtomatik kuzatish\n"
+        "/unwatch SYMBOL — kuzatishni to‘xtatish\n"
+        "/list — kuzatuvdagi aktivlar ro‘yxati"
+    )
+
+async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Aktivni kiriting. Masalan: /signal BTCUSDT yoki /signal XAUUSD")
+        return
+    symbol = context.args[0].upper()
+    await update.message.reply_text(f"🔎 {symbol} uchun signal hisoblanmoqda...")
+    res = evaluate(symbol)
+    if not res["ok"]:
+        await update.message.reply_text(f"❌ {res['error']}")
+        return
+    text = f"📊 {res['symbol']}\n💰 Narx: {res['price']}\n📈 RSI: {res['rsi']}\nMA5: {res['ma5']}  MA20: {res['ma20']}\n\n"
+    if res["signal"] == "BUY":
+        text += f"📥 Signal: BUY 📈\n🎯 TP: {round(res['tp'],6)}\n🛑 SL: {round(res['sl'],6)}"
+    elif res["signal"] == "SELL":
+        text += f"📤 Signal: SELL 📉\n🎯 TP: {round(res['tp'],6)}\n🛑 SL: {round(res['sl'],6)}"
+    else:
+        text += "⏳ Hozircha aniq signal yo‘q, kutish tavsiya qilinadi."
+    await update.message.reply_text(text)
+
+async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Masalan: /watch XAUUSD")
+        return
+    chat = update.message.chat_id
+    sym = context.args[0].upper()
+    watched.setdefault(chat, set()).add(sym)
+    await update.message.reply_text(f"✅ {sym} endi kuzatilmoqda. Har {POLL_INTERVAL}s da tekshiriladi.")
+
+async def unwatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.message.chat_id
+    if not context.args:
+        await update.message.reply_text("Masalan: /unwatch XAUUSD")
+        return
+    sym = context.args[0].upper()
+    if sym in watched.get(chat, set()):
+        watched[chat].remove(sym)
+        await update.message.reply_text(f"❌ {sym} o‘chirildi.")
+    else:
+        await update.message.reply_text(f"{sym} kuzatuvda emas.")
+
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.message.chat_id
+    syms = watched.get(chat, set())
+    if not syms:
+        await update.message.reply_text("🔍 Hech narsa kuzatilmayapti.")
+    else:
+        await update.message.reply_text("📋 Kuzatuvdagi aktivlar:\n" + "\n".join(syms))
+
+# ========== Kuzatuv (fon jarayon) ==========
+async def monitor(app):
+    await asyncio.sleep(3)
+    print("📡 Monitor ishga tushdi...")
+    while True:
+        try:
+            for chat, syms in watched.items():
+                for s in list(syms):
+                    res = evaluate(s)
+                    if not res["ok"]:
+                        continue
+                    prev = last_signals.get((chat, s))
+                    cur = res["signal"]
+                    if cur in ["BUY", "SELL"] and cur != prev:
+                        msg = (
+                            f"📊 {s}\n💰 Narx: {res['price']}\n📈 RSI: {res['rsi']}\n"
+                            f"Signal: {cur} {'📈' if cur=='BUY' else '📉'}\n"
+                            f"🎯 TP: {round(res['tp'],6)}\n🛑 SL: {round(res['sl'],6)}"
+                        )
+                        await app.bot.send_message(chat_id=chat, text=msg)
+                        last_signals[(chat, s)] = cur
+                    await asyncio.sleep(1)
+            await asyncio.sleep(POLL_INTERVAL)
+        except Exception as e:
+            print("Monitor error:", e)
+            await asyncio.sleep(5)
+
+# ========== Ishga tushirish ==========
+def main():
+    if BOT_TOKEN.startswith("BU_YERGA"):
+        print("⚠️ Iltimos, BOT_TOKEN ni kiriting!")
+        return
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("signal", signal_cmd))
+    app.add_handler(CommandHandler("watch", watch_cmd))
+    app.add_handler(CommandHandler("unwatch", unwatch_cmd))
+    app.add_handler(CommandHandler("list", list_cmd))
+
+    app.create_task(monitor(app))
+    print("🤖 TP/SL versiya bot ishga tushmoqda...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
